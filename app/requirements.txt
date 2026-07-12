@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+langchain
+langchain-classic
+langchain-openai
+langchain-chroma
+langchain-community
+rank-bm25
+chromadb
+tenacity
+pydantic>=2

@@ -1,0 +1,28 @@
+services:
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: copyright-rag-api:latest
+    container_name: copyright-rag-api
+    # Container now listens on 80 (ECS Express default); expose it locally on 8000.
+    ports:
+      - "8000:80"
+    # OPENAI_API_KEY (and any RAG_* overrides) come from a local .env file.
+    # Copy .env.example to .env and fill it in.
+    env_file:
+      - .env
+    volumes:
+      # The Chroma databases live on the host and are mounted in. Both are
+      # mounted read-write: ChromaDB is backed by SQLite, which must open its
+      # database file read-write (for WAL/lock sidecar files) even for queries,
+      # so a read-only mount fails with "attempt to write a readonly database".
+      - ./chroma_rag_db:/code/chroma_rag_db
+      - ./chroma_cache_db:/code/chroma_cache_db
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:80/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
