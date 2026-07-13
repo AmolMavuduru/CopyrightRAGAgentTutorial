@@ -3,20 +3,28 @@
 Run locally with::
 
     export OPENAI_API_KEY=sk-...
+    export RAG_API_KEY=some-long-random-secret   # required to call /ask
     uvicorn app.app:app --reload --port 8000
 
 The heavy :class:`CopyrightRAGAgent` (vector store, BM25 index, agent) is built
 once on start-up via the lifespan handler and reused across all requests.
+
+The ``/ask`` endpoint is protected by an ``X-API-Key`` header (see
+``require_api_key``); ``/`` and ``/health`` stay open so the ECS/ALB health
+check works.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import secrets
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Set
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Security, status
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import BaseModel, Field
 
 from .rag_agent import CopyrightRAGAgent, _retryable_exceptions
@@ -27,6 +35,49 @@ RETRYABLE_EXCEPTIONS = _retryable_exceptions()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------- authentication
+
+API_KEY_HEADER_NAME = "X-API-Key"
+# auto_error=False so we can control the response and support an "unset" mode.
+_api_key_header = APIKeyHeader(name=API_KEY_HEADER_NAME, auto_error=False)
+
+
+def _configured_api_keys() -> Set[str]:
+    """Accepted client API keys, parsed from the RAG_API_KEY env var.
+
+    Supports a comma-separated list so keys can be rotated (old + new valid at
+    once). Set this on the ECS service, the same way as OPENAI_API_KEY.
+    """
+    raw = os.getenv("RAG_API_KEY", "")
+    return {key.strip() for key in raw.split(",") if key.strip()}
+
+
+def require_api_key(api_key: Optional[str] = Security(_api_key_header)) -> None:
+    """FastAPI dependency enforcing the ``X-API-Key`` header on protected routes.
+
+    If ``RAG_API_KEY`` is not configured, authentication is disabled (fail open)
+    and a warning is logged — convenient for local dev, but you MUST set
+    ``RAG_API_KEY`` on the ECS deployment. When configured, a valid key is
+    required and compared in constant time to avoid timing attacks.
+    """
+    accepted = _configured_api_keys()
+    if not accepted:
+        logger.warning(
+            "RAG_API_KEY is not set: the /ask endpoint is UNPROTECTED. "
+            "Set RAG_API_KEY to require an X-API-Key header."
+        )
+        return
+
+    if api_key and any(secrets.compare_digest(api_key, k) for k in accepted):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or missing API key.",
+        headers={"WWW-Authenticate": API_KEY_HEADER_NAME},
+    )
 
 
 # --------------------------------------------------------------------- schemas
@@ -110,7 +161,7 @@ def health() -> HealthResponse:
     return HealthResponse(status="ok" if agent_ready else "starting", agent_ready=agent_ready)
 
 
-@app.post("/ask", response_model=AskResponse)
+@app.post("/ask", response_model=AskResponse, dependencies=[Depends(require_api_key)])
 def ask(request: AskRequest) -> AskResponse:
     agent = get_agent()
     try:
